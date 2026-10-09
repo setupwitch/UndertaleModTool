@@ -140,7 +140,7 @@ public class UndertaleRoom : UndertaleNamedResource, IProjectAsset, INotifyPrope
     /// <remarks>
     /// This is an UndertaleModTool-only property; it doesn't exist in game data.
     /// </remarks>
-    public double GridWidth { get => _gridWidth; set { if (value >= 0) _gridWidth = value; } }
+    public double AssumedGridWidth { get => _gridWidth; set { if (value >= 0) _gridWidth = value; } }
 
     /// <summary>
     /// The height of the room grid in pixels.
@@ -148,7 +148,7 @@ public class UndertaleRoom : UndertaleNamedResource, IProjectAsset, INotifyPrope
     /// <remarks>
     /// This is an UndertaleModTool-only property; it doesn't exist in game data.
     /// </remarks>
-    public double GridHeight { get => _gridHeight; set { if (value >= 0) _gridHeight = value; } }
+    public double AssumedGridHeight { get => _gridHeight; set { if (value >= 0) _gridHeight = value; } }
 
     /// <summary>
     /// The thickness of the room grid in pixels.
@@ -500,80 +500,133 @@ public class UndertaleRoom : UndertaleNamedResource, IProjectAsset, INotifyPrope
 
         return count;
     }
+    
+    /// <summary>
+    /// A simple function to infer grid size from a list of positions, used for <see cref="SetupRoom"/>
+    /// </summary>
+    public (int width, int height) InferGridFromPositions(IEnumerable<(int x, int y)> positions)
+    {
+        const float SNAP_THRESHOLD = 0.80f; // 80%
+        // common values for room grid sizes
+        int[] gridCandidates = [ 64, 48, 32, 24, 16, 8 ];
+        
+        var posList = positions as List<(int x, int y)> ?? positions.ToList();
+        int totalCount = posList.Count;
+        
+        
+        // if theres less than 5, it may not be accurate
+        if (totalCount < 5)
+        {
+            return (32, 32);
+        }
 
+        int bestGridX = 32;
+        int bestGridY = 32;
+            
+        foreach (int g in gridCandidates)
+        {
+            int snappedCount = posList.Count(p => p.x % g == 0);
+            if ((float)snappedCount / totalCount >= SNAP_THRESHOLD)
+            {
+                bestGridX = g;
+                break;
+            }
+        }
+            
+        foreach (int g in gridCandidates)
+        {
+            int snappedCount = posList.Count(p => p.y % g == 0);
+            if ((float)snappedCount / totalCount >= SNAP_THRESHOLD)
+            {
+                bestGridY = g;
+                break;
+            }
+        }
+            
+        return (bestGridX, bestGridY);
+    }
+    
     /// <summary>
     /// Initialize the room by setting every <see cref="Background.ParentRoom"/> or <see cref="Layer.ParentRoom"/>
     /// (depending on the GameMaker version), and optionally calculate the room grid size.
     /// </summary>
     /// <param name="calculateGridWidth">Whether to calculate the room grid width.</param>
     /// <param name="calculateGridHeight">Whether to calculate the room grid height.</param>
-    public void SetupRoom(bool calculateGridWidth = true, bool calculateGridHeight = true)
+    public void SetupRoom(bool calculateGridDimensions = true)
     {
         foreach (Layer layer in Layers)
         {
-            if (layer != null)
-                layer.ParentRoom = this;
-        }
-        foreach (UndertaleRoom.Background bgnd in Backgrounds)
-            bgnd.ParentRoom = this;
-
-        if (!(calculateGridWidth || calculateGridHeight)) return;
-
-        // Automatically set the grid size to whatever most tiles are sized
-
-        Dictionary<Point, uint> tileSizes = new();
-        IEnumerable<Tile> tileList;
-
-        if (Layers.Count > 0)
-        {
-            tileList = new List<Tile>();
-            foreach (Layer layer in Layers)
+            if (layer is null)
             {
-                if (layer.LayerType == LayerType.Assets)
-                    tileList = tileList.Concat(layer.AssetsData.LegacyTiles);
-                else if (layer.LayerType == LayerType.Tiles && layer.TilesData.TileData.Length != 0 && layer.TilesData.Background is not null)
-                {
-                    int w = (int)layer.TilesData.Background.GMS2TileWidth;
-                    int h = (int)layer.TilesData.Background.GMS2TileHeight;
-                    Point scale = new(w, h);
-                    uint numTiles = layer.TilesData.TilesX * layer.TilesData.TilesY;
-                    if (tileSizes.ContainsKey(scale))
-                        tileSizes[scale] += numTiles;
-                    else
-                        tileSizes[scale] = numTiles;
-                }
+                continue;
             }
 
+            layer.ParentRoom = this;
+
+            if (!calculateGridDimensions)
+            {
+                continue;
+            }
+            // default value in IDE
+            layer.AssumedGridWidth = 32;
+            layer.AssumedGridHeight = 32;
+            
+            if (layer.LayerType == LayerType.Tiles && layer.TilesData?.Background is not null)
+            {
+                // use the tile width and height
+                layer.AssumedGridWidth = layer.TilesData.Background.GMS2TileWidth;
+                layer.AssumedGridHeight = layer.TilesData.Background.GMS2TileHeight;
+            }
+            else if (layer.LayerType == LayerType.Assets && layer.AssetsData is not null)
+            {
+                IEnumerable<(int x, int y)> positions = layer.AssetsData?.GetAllPositions();
+                var (w, h) = InferGridFromPositions(positions);
+                layer.AssumedGridWidth = w;
+                layer.AssumedGridHeight = h;
+            }
+            else if (layer.LayerType == LayerType.Instances && layer.InstancesData?.Instances is not null)
+            {
+                IEnumerable<(int x, int y)> positions = layer.InstancesData.Instances.Select(i => (i.X, i.Y));
+                var (w, h) = InferGridFromPositions(positions);
+                layer.AssumedGridWidth = w;
+                layer.AssumedGridHeight = h;
+            }
         }
-        else
-            tileList = Tiles;
-
-        // Loop through each tile and save how many times their sizes are used
-        foreach (Tile tile in tileList)
+        
+        // combine layers with tiles, instances, and assets
+        List<Layer> activeLayers = Layers.Where(l => l is not null && (
+            (l.LayerType == LayerType.Tiles && l.TilesData?.Background is not null) ||
+            (l.LayerType == LayerType.Instances && l.InstancesData?.Instances?.Count > 0) ||
+            (l.LayerType == LayerType.Assets && l.AssetsData?.GetAllPositions().Any() == true)
+        )).ToList();
+        
+        foreach (Background bgnd in Backgrounds)
         {
-            Point scale = new((int) tile.Width, (int) tile.Height);
-            if (tileSizes.ContainsKey(scale))
-                tileSizes[scale]++;
-            else
-                tileSizes.Add(scale, 1);
+            bgnd.ParentRoom = this;
         }
 
-
-        if (tileSizes.Count <= 0)
+        if (!calculateGridDimensions)
         {
-            if (calculateGridWidth)
-                GridWidth = 16;
-            if (calculateGridHeight)
-                GridHeight = 16;
             return;
         }
-
-        // If tiles exist at all, grab the most used tile size and use that as our grid size
-        var largestKey = tileSizes.Aggregate((x, y) => x.Value > y.Value ? x : y).Key;
-        if (calculateGridWidth)
-            GridWidth = largestKey.X;
-        if (calculateGridHeight)
-            GridHeight = largestKey.Y;
+        
+        if (activeLayers.Count > 0)
+        {
+            // find the most common pair
+            var mostCommonGrid = activeLayers
+                .GroupBy(l => (l.AssumedGridWidth, l.AssumedGridHeight))
+                .MaxBy(group => group.Count())!
+                .Key;
+            
+            AssumedGridWidth = mostCommonGrid.AssumedGridWidth;
+            AssumedGridHeight = mostCommonGrid.AssumedGridHeight;
+        }
+        else
+        {
+            // default
+            AssumedGridWidth = 32;
+            AssumedGridHeight = 32;
+        }
     }
 
     /// <inheritdoc />
@@ -1427,7 +1480,26 @@ public class UndertaleRoom : UndertaleNamedResource, IProjectAsset, INotifyPrope
 
         private UndertaleRoom _parentRoom;
         private int _layerDepth;
+        private double _gridWidth = 32.0;
+        private double _gridHeight = 32.0;
+        
+        
+        /// <summary>
+        /// The width of the layer grid in pixels.
+        /// </summary>
+        /// <remarks>
+        /// This is an UndertaleModTool-only property; it doesn't exist in game data.
+        /// </remarks>
+        public double AssumedGridWidth { get => _gridWidth; set { if (value >= 0) _gridWidth = value; } }
 
+        /// <summary>
+        /// The height of the layer grid in pixels.
+        /// </summary>
+        /// <remarks>
+        /// This is an UndertaleModTool-only property; it doesn't exist in game data.
+        /// </remarks>
+        public double AssumedGridHeight { get => _gridHeight; set { if (value >= 0) _gridHeight = value; } }
+        
         /// <summary>
         /// The room this layer belongs to.
         /// </summary>
@@ -2113,7 +2185,29 @@ public class UndertaleRoom : UndertaleNamedResource, IProjectAsset, INotifyPrope
 #pragma warning disable CS0067 // TODO: remove this suppression once Fody is no longer in use
             public event PropertyChangedEventHandler PropertyChanged;
 #pragma warning restore CS0067
-
+            
+            /// <summary>
+            /// Obtains the position of every asset in the layer.
+            /// </summary>
+            public IEnumerable<(int X, int Y)> GetAllPositions()
+            {
+                if (LegacyTiles is not null)
+                    foreach (var tile in LegacyTiles)
+                        yield return (tile.X, tile.Y);
+                if (Sprites is not null)
+                    foreach (var spr in Sprites)
+                        yield return (spr.X, spr.Y);
+                if (Sequences is not null)
+                    foreach (var seq in Sequences)
+                        yield return (seq.X, seq.Y);
+                if (TextItems is not null)
+                    foreach (var txt in TextItems)
+                        yield return (txt.X, txt.Y);
+                if (ParticleSystems is not null)
+                    foreach (var ps in ParticleSystems)
+                        yield return (ps.X, ps.Y);
+            }
+            
             /// <inheritdoc />
             public void Serialize(UndertaleWriter writer)
             {
